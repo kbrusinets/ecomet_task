@@ -12,6 +12,23 @@ from aiohttp import ClientSession, ClientResponse
 
 from settings import get_settings
 
+"""
+В основе параллелизма лежит очередь тасков - _task_queue.
+
+Таски могут быть двух типов: _process_commit_page и _process_watchers.
+_process_commit_page запрашивает и парсит страницу с коммитами и, если она первая, 
+создает оставшиеся N-1 аналогичных тасков, по одному на страницу коммитов в репе, и кладет их в очередь.
+_process_watchers запрашивает и парсит количество watcher'ов у репы. Это нужно делать потому что в ответе search/repositories 
+в поле с названием watchers вместо нужного значения хранится количество звезд, а поля subscribers_count, в котором
+лежит нужное значение, нет.
+(https://docs.github.com/en/rest/activity/starring?apiVersion=2022-11-28#starring-versus-watching).
+
+Количество одновременных запросов регулируется количеством worker'ов, обслуживающих очередь.
+Количество запросов в секунду - методом _rate_limiter().
+Как только вся информация для репозитория собрана, он отправляется в БД.
+"""
+
+
 logging.basicConfig(level=logging.INFO)
 
 GITHUB_API_BASE_URL: Final[str] = "https://api.github.com"
@@ -65,8 +82,7 @@ class GithubReposScrapper:
         self._db_client = None
         self._exec_time = None
         self._access_token = access_token
-        self._request_queue = asyncio.Queue()
-        self._repos_queue = asyncio.Queue()
+        self._task_queue = asyncio.Queue()
         self._temp_repos_result: Dict[str, TempRepository] = {}
         self._repos_result: List[Repository] = []
 
@@ -206,7 +222,7 @@ class GithubReposScrapper:
                     language=repo['language'],
                     authors_commits_num_today=[]
                 )
-            await self._request_queue.put(
+            await self._task_queue.put(
                 self._process_watchers(
                     WatchersTask(
                         owner=repo['owner']['login'],
@@ -214,7 +230,7 @@ class GithubReposScrapper:
                     )
                 )
             )
-            await self._request_queue.put(
+            await self._task_queue.put(
                 self._process_commit_page(
                     CommitPageTask(
                         owner=repo['owner']['login'],
@@ -241,7 +257,7 @@ class GithubReposScrapper:
                 last_page = int(response.links['last']['url'].query.get('page'))
                 cur_repo.pages_left = last_page
             for page in range(2, last_page + 1):
-                await self._request_queue.put(
+                await self._task_queue.put(
                     self._process_commit_page(
                         CommitPageTask(
                             owner=params.owner,
@@ -278,7 +294,7 @@ class GithubReposScrapper:
 
     async def _worker(self) -> None:
         while True:
-            task = await self._request_queue.get()
+            task = await self._task_queue.get()
             if task is None:
                 break
             task_name = task.__qualname__
@@ -288,7 +304,7 @@ class GithubReposScrapper:
             except Exception:
                 logging.exception(f'Error in {task_name} with params {task_params}.')
             finally:
-                self._request_queue.task_done()
+                self._task_queue.task_done()
 
     async def get_repositories(self) -> list[Repository]:
         self._session = ClientSession(
@@ -312,9 +328,9 @@ class GithubReposScrapper:
         try:
             await self._process_get_repos()
             workers = [asyncio.create_task(self._worker()) for _ in range(self._concurrent_limit)]
-            await self._request_queue.join()
+            await self._task_queue.join()
             for _ in range(self._concurrent_limit):
-                await self._request_queue.put(None)
+                await self._task_queue.put(None)
             await asyncio.gather(*workers)
         except Exception as e:
             logging.exception(e)
