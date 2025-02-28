@@ -9,6 +9,11 @@ from fastapi import APIRouter, FastAPI, Depends, HTTPException
 from db import get_db
 
 
+"""
+Управление базой вынесено в класс Db в db.py. В нём хранится пул, который выдаёт соединения.
+"""
+
+
 def setup_logging():
     os.makedirs('logs', exist_ok=True)
     with open('log_conf.yaml', 'r') as f:
